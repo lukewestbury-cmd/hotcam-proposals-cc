@@ -1,0 +1,1 @@
+# hotcam-proposals-cc
