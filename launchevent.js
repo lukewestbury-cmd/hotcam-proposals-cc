@@ -22,6 +22,8 @@ var KEYWORDS = /\b(quot(e|es|ed|ing|ation|ations)|budgets?|proposals?|estimates?
 var ATTACHMENT_NAMES = /(quot|estimat|proposal|budget|costing|pricing|rate ?card)/i;
 var SESSION_FLAG = "hotcamProposalsPrompted";
 var MAX_QUOTED_CHARS = 5000;
+var READ_TIMEOUT_MS = 2500;  // Outlook shows "taking longer than expected" after a few seconds
+var WRITE_TIMEOUT_MS = 1500;
 
 // Trace lines show in the browser console (Outlook on the web) for troubleshooting.
 function trace(msg) {
@@ -123,23 +125,32 @@ function onMessageSendHandler(event) {
   var allow = function () { finish({ allowEvent: true }); };
   var ok = function (r) { return r && r.status === Office.AsyncResultStatus.Succeeded; };
 
-  var block = function () {
-    // Add the CC and set the "already asked" flag at the same time.
+  var promptUser = function (added, diag) {
+    finish({
+      allowEvent: false,
+      errorMessage: (added
+        ? "This looks like a quote, estimate or proposal email, so " + TARGET + " has been added to CC.\n\n" +
+          "Send Anyway: send it with proposals@ copied in.\n" +
+          "Don't Send: go back to check it. If proposals@ isn't needed, remove it and send again."
+        : "This looks like a quote, estimate or proposal email. Should " + TARGET + " be copied in?\n\n" +
+          "Don't Send: go back and add proposals@ to CC.\n" +
+          "Send Anyway: send it as it is.") + (diag || "")
+    });
+  };
+
+  var block = function (diag) {
+    // Add the CC and set the "already asked" flag at the same time. If Outlook
+    // is slow to confirm, prompt anyway rather than leave the user waiting.
     var pending = 2, added = false;
     var done = function () {
       if (--pending) return;
-      if (!added) return allow();
-      finish({
-        allowEvent: false,
-        errorMessage:
-          "This looks like a quote, estimate or proposal email, so " + TARGET +
-          " has been added to CC.\n\n" +
-          "Send Anyway: send it with proposals@ copied in.\n" +
-          "Don't Send: go back to check it. If proposals@ isn't needed, remove it and send again."
-      });
+      promptUser(added, diag);
     };
-    item.cc.addAsync([TARGET], function (r) { added = ok(r); done(); });
-    item.sessionData.setAsync(SESSION_FLAG, "1", function () { done(); });
+    setTimeout(function () {
+      if (!finished) { trace("cc/flag write timed out"); promptUser(added, diag); }
+    }, WRITE_TIMEOUT_MS);
+    item.cc.addAsync([TARGET], function (r) { added = ok(r); trace("cc add " + (r && r.status)); done(); });
+    item.sessionData.setAsync(SESSION_FLAG, "1", function (r) { trace("flag set " + (r && r.status)); done(); });
   };
 
   try {
@@ -159,27 +170,41 @@ function onMessageSendHandler(event) {
     };
     var names = ["to", "cc", "bcc", "subject", "body", "flag", "attachments"];
     var outstanding = names.length;
+    var decided = false;
 
     var decide = function () {
-      if (!ok(res.to) || !ok(res.cc) || !ok(res.bcc)) return allow();
-      if (hasTarget([res.to.value, res.cc.value, res.bcc.value])) return allow();
+      if (decided) return;
+      decided = true;
+      var missing = [];
+      for (var n = 0; n < names.length; n++) if (!(names[n] in res)) missing.push(names[n]);
+      var diag = missing.length ? "\n\n(Check couldn't finish: no reply from Outlook for " + missing.join(", ") + ".)" : "";
+      if (missing.length) trace("timed out waiting on " + missing.join(", "));
+
+      if (ok(res.to) && ok(res.cc) && ok(res.bcc) &&
+          hasTarget([res.to.value, res.cc.value, res.bcc.value])) return allow();
       // Already prompted on this email and the user removed the CC: respect that.
       if (ok(res.flag) && res.flag.value) return allow();
 
       var keywordHit = ok(res.subject) && ok(res.body) && mentionsKeywords(res.subject.value, res.body.value);
       var attachmentHit = ok(res.attachments) && attachmentsLookLikeQuote(res.attachments.value);
-      if (keywordHit || attachmentHit) return block();
+      if (keywordHit || attachmentHit) return block(diag);
+      // Couldn't read the subject or body in time: ask rather than guess.
+      if (!(ok(res.subject) && ok(res.body)) && missing.length) return promptUser(false, diag);
       allow();
     };
+    var safeDecide = function () {
+      try { decide(); } catch (e) { trace("decide error: " + e); allow(); }
+    };
+
+    // Don't wait on Outlook forever: decide with whatever has come back.
+    setTimeout(safeDecide, READ_TIMEOUT_MS);
 
     for (var i = 0; i < names.length; i++) {
       (function (name) {
         calls[name](function (r) {
           trace(name + " " + (r ? r.status : "n/a") + ", waiting on " + (outstanding - 1));
           res[name] = r;
-          if (--outstanding === 0) {
-            try { decide(); } catch (e) { trace("decide error: " + e); allow(); }
-          }
+          if (--outstanding === 0) safeDecide();
         });
       })(names[i]);
     }
