@@ -106,52 +106,74 @@ function hasTarget(recipientLists) {
 
 function onMessageSendHandler(event) {
   var item = Office.context.mailbox.item;
-  var allow = function () { event.completed({ allowEvent: true }); };
-  var ok = function (r) { return r.status === Office.AsyncResultStatus.Succeeded; };
+  var finished = false;
+  var finish = function (result) {
+    if (finished) return;
+    finished = true;
+    event.completed(result);
+  };
+  var allow = function () { finish({ allowEvent: true }); };
+  var ok = function (r) { return r && r.status === Office.AsyncResultStatus.Succeeded; };
 
-  var prompt = function () {
-    // Already prompted on this email and the user removed the CC: respect that.
-    item.sessionData.getAsync(SESSION_FLAG, function (flagRes) {
-      if (ok(flagRes) && flagRes.value) return allow();
-
-      item.cc.addAsync([TARGET], function (addRes) {
-        if (!ok(addRes)) return allow();
-        item.sessionData.setAsync(SESSION_FLAG, "1", function () {
-          event.completed({
-            allowEvent: false,
-            errorMessage:
-              "This looks like a quote, estimate or proposal email, so " + TARGET +
-              " has been added to CC.\n\n" +
-              "Send Anyway: send it with proposals@ copied in.\n" +
-              "Don't Send: go back to check it. If proposals@ isn't needed, remove it and send again."
-          });
-        });
+  var block = function () {
+    // Add the CC and set the "already asked" flag at the same time.
+    var pending = 2, added = false;
+    var done = function () {
+      if (--pending) return;
+      if (!added) return allow();
+      finish({
+        allowEvent: false,
+        errorMessage:
+          "This looks like a quote, estimate or proposal email, so " + TARGET +
+          " has been added to CC.\n\n" +
+          "Send Anyway: send it with proposals@ copied in.\n" +
+          "Don't Send: go back to check it. If proposals@ isn't needed, remove it and send again."
       });
-    });
+    };
+    item.cc.addAsync([TARGET], function (r) { added = ok(r); done(); });
+    item.sessionData.setAsync(SESSION_FLAG, "1", function () { done(); });
   };
 
   try {
-    item.to.getAsync(function (toRes) {
-      item.cc.getAsync(function (ccRes) {
-        item.bcc.getAsync(function (bccRes) {
-          if (!ok(toRes) || !ok(ccRes) || !ok(bccRes)) return allow();
-          if (hasTarget([toRes.value, ccRes.value, bccRes.value])) return allow();
+    // Ask Outlook for everything at once rather than one after another.
+    var res = {};
+    var calls = {
+      to: function (cb) { item.to.getAsync(cb); },
+      cc: function (cb) { item.cc.getAsync(cb); },
+      bcc: function (cb) { item.bcc.getAsync(cb); },
+      subject: function (cb) { item.subject.getAsync(cb); },
+      body: function (cb) { item.body.getAsync(Office.CoercionType.Text, cb); },
+      flag: function (cb) { item.sessionData.getAsync(SESSION_FLAG, cb); },
+      attachments: function (cb) {
+        if (typeof item.getAttachmentsAsync !== "function") return cb(null);
+        item.getAttachmentsAsync(cb);
+      }
+    };
+    var names = ["to", "cc", "bcc", "subject", "body", "flag", "attachments"];
+    var outstanding = names.length;
 
-          item.subject.getAsync(function (subRes) {
-            item.body.getAsync(Office.CoercionType.Text, function (bodyRes) {
-              if (!ok(subRes) || !ok(bodyRes)) return allow();
-              if (mentionsKeywords(subRes.value, bodyRes.value)) return prompt();
+    var decide = function () {
+      if (!ok(res.to) || !ok(res.cc) || !ok(res.bcc)) return allow();
+      if (hasTarget([res.to.value, res.cc.value, res.bcc.value])) return allow();
+      // Already prompted on this email and the user removed the CC: respect that.
+      if (ok(res.flag) && res.flag.value) return allow();
 
-              if (typeof item.getAttachmentsAsync !== "function") return allow();
-              item.getAttachmentsAsync(function (attRes) {
-                if (ok(attRes) && attachmentsLookLikeQuote(attRes.value)) return prompt();
-                allow();
-              });
-            });
-          });
+      var keywordHit = ok(res.subject) && ok(res.body) && mentionsKeywords(res.subject.value, res.body.value);
+      var attachmentHit = ok(res.attachments) && attachmentsLookLikeQuote(res.attachments.value);
+      if (keywordHit || attachmentHit) return block();
+      allow();
+    };
+
+    for (var i = 0; i < names.length; i++) {
+      (function (name) {
+        calls[name](function (r) {
+          res[name] = r;
+          if (--outstanding === 0) {
+            try { decide(); } catch (e) { allow(); }
+          }
         });
-      });
-    });
+      })(names[i]);
+    }
   } catch (e) {
     allow(); // never block sending because of an add-in error
   }
