@@ -23,6 +23,12 @@ var ATTACHMENT_NAMES = /(quot|estimat|proposal|budget|costing|pricing|rate ?card
 var SESSION_FLAG = "hotcamProposalsPrompted";
 var MAX_QUOTED_CHARS = 5000;
 
+// Trace lines show in the browser console (Outlook on the web) for troubleshooting.
+function trace(msg) {
+  try { if (typeof console !== "undefined") console.log("[ProposalsCC] " + msg); } catch (e) {}
+}
+trace("script loaded");
+
 // Reply/forward header markers, in the forms Outlook, Apple Mail and Gmail write them.
 var MARKERS = [
   /^[ \t]*From:[ \t]/gim,                    // Outlook reply header
@@ -105,11 +111,13 @@ function hasTarget(recipientLists) {
 }
 
 function onMessageSendHandler(event) {
+  trace("send event received");
   var item = Office.context.mailbox.item;
   var finished = false;
   var finish = function (result) {
     if (finished) return;
     finished = true;
+    trace("completed: " + (result.allowEvent ? "allow send" : "prompt"));
     event.completed(result);
   };
   var allow = function () { finish({ allowEvent: true }); };
@@ -167,20 +175,23 @@ function onMessageSendHandler(event) {
     for (var i = 0; i < names.length; i++) {
       (function (name) {
         calls[name](function (r) {
+          trace(name + " " + (r ? r.status : "n/a") + ", waiting on " + (outstanding - 1));
           res[name] = r;
           if (--outstanding === 0) {
-            try { decide(); } catch (e) { allow(); }
+            try { decide(); } catch (e) { trace("decide error: " + e); allow(); }
           }
         });
       })(names[i]);
     }
   } catch (e) {
+    trace("handler error: " + e);
     allow(); // never block sending because of an add-in error
   }
 }
 
 if (typeof Office !== "undefined" && Office.actions) {
   Office.actions.associate("onMessageSendHandler", onMessageSendHandler);
+  trace("handler registered");
 }
 if (typeof module !== "undefined") {
   module.exports = {
