@@ -114,7 +114,7 @@ function hasTarget(recipientLists) {
 
 function onMessageSendHandler(event) {
   trace("send event received");
-  var item = Office.context.mailbox.item;
+  var item;
   var finished = false;
   var finish = function (result) {
     if (finished) return;
@@ -154,6 +154,7 @@ function onMessageSendHandler(event) {
   };
 
   try {
+    item = Office.context.mailbox.item;
     // Ask Outlook for everything at once rather than one after another.
     var res = {};
     var calls = {
@@ -214,6 +215,11 @@ function onMessageSendHandler(event) {
   }
 }
 
+// Outlook on the web / New Outlook won't hand over the send event until the
+// add-in says it's ready.
+if (typeof Office !== "undefined" && typeof Office.onReady === "function") {
+  Office.onReady(function () { trace("Office ready"); });
+}
 if (typeof Office !== "undefined" && Office.actions) {
   Office.actions.associate("onMessageSendHandler", onMessageSendHandler);
   trace("handler registered");
