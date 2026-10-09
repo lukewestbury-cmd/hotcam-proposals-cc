@@ -1,13 +1,18 @@
 # Hotcam Proposals CC check
 
-Outlook add-in. When you send an email whose subject or new text mentions
-**quote / quotation / budget / proposal**, and proposals@hotcam.tv isn't on it,
-it adds proposals@ to CC and asks:
+Outlook add-in. When you send an email that looks like a quote, and proposals@hotcam.tv isn't on it,
+it adds proposals@ to CC and asks. It checks:
+
+- the subject and the new text you've typed for **quote, quotation, estimate, budget, proposal, pricing, price, costing, rate card**, or **day, hire, crew or kit rates**
+- the most recent email in the thread you're replying to (so a client asking "can you quote for..." counts), but not older history
+- attachment names containing quote, estimate, proposal, budget, costing, pricing or rate card
+
+Then:
 
 - **Send Anyway** – sends with proposals@ copied in
 - **Don't Send** – back to the draft. Remove the CC if not needed and send again; it won't ask twice for the same email.
 
-The quoted reply chain is ignored, so replying to an old thread that mentioned a budget won't trigger it.
+Older emails further down a thread are ignored, so replying to a long thread that once mentioned a budget won't trigger it. "Frame rate" and "bit rate" don't count.
 Works in New Outlook (Mac and Windows), classic Outlook for Windows, and Outlook on the web.
 If anything goes wrong inside the add-in, it lets the email send rather than blocking it.
 

@@ -1,9 +1,13 @@
 /*
  * Hotcam – Proposals CC check (Outlook Smart Alerts, OnMessageSend)
  *
- * On Send: if the subject or the new (non-quoted) body text mentions
- * quote / budget / proposal, and proposals@hotcam.tv isn't already a
- * recipient, it adds proposals@ to CC and shows a prompt:
+ * On Send it checks for a quote / estimate / budget / proposal in:
+ *   - the subject
+ *   - the new (non-quoted) text you've typed
+ *   - the most recent email in the thread you're replying to (not older history)
+ *   - attachment file names (e.g. "Job - Quote - V1.0.pdf")
+ * If one matches and proposals@hotcam.tv isn't already a recipient, it adds
+ * proposals@ to CC and shows a prompt:
  *   "Send Anyway" -> sends with proposals@ copied in
  *   "Don't Send"  -> back to the draft; remove the CC if not needed and
  *                    send again (it won't nag a second time for that email)
@@ -13,29 +17,81 @@
  */
 
 var TARGET = "proposals@hotcam.tv";
-var KEYWORDS = /\b(quot(e|es|ation|ations)|budgets?|proposals?)\b/i;
+// "rate" alone is too broad in broadcast (frame rate, bit rate), so only priced rates count.
+var KEYWORDS = /\b(quot(e|es|ed|ing|ation|ations)|budgets?|proposals?|estimates?|pricing|prices?|costings?|rate ?cards?|(day|hire|crew|kit) rates?)\b/i;
+var ATTACHMENT_NAMES = /(quot|estimat|proposal|budget|costing|pricing|rate ?card)/i;
 var SESSION_FLAG = "hotcamProposalsPrompted";
+var MAX_QUOTED_CHARS = 5000;
+
+// Reply/forward header markers, in the forms Outlook, Apple Mail and Gmail write them.
+var MARKERS = [
+  /^[ \t]*From:[ \t]/gim,                    // Outlook reply header
+  /^[ \t]*-{2,}[ \t]*Original Message/gim,   // older Outlook
+  /^[ \t]*On .{1,200} wrote:[ \t]*$/gim,     // Apple Mail / Gmail style
+  /^[ \t]*_{10,}[ \t]*$/gm                   // Outlook separator line
+];
+var HEADER_LINE = /^[ \t]*(From|Sent|To|Cc|Bcc|Subject|Date):|^[ \t]*-{2,}[ \t]*Original Message|^[ \t]*On .{1,200} wrote:[ \t]*$|^[ \t]*_{10,}[ \t]*$/i;
+
+function markerPositions(text) {
+  var found = [];
+  for (var i = 0; i < MARKERS.length; i++) {
+    var re = MARKERS[i];
+    re.lastIndex = 0;
+    var m;
+    while ((m = re.exec(text)) !== null) {
+      found.push(m.index);
+      if (re.lastIndex === m.index) re.lastIndex++;
+    }
+  }
+  return found.sort(function (a, b) { return a - b; });
+}
 
 // Text above the first reply/forward header, i.e. what you've actually typed.
 function stripQuoted(text) {
-  var markers = [
-    /^[ \t]*From:[ \t]/im,                    // Outlook reply header
-    /^[ \t]*-{2,}[ \t]*Original Message/im,   // older Outlook
-    /^[ \t]*On .{1,200} wrote:[ \t]*$/im,     // Apple Mail / Gmail style
-    /^[ \t]*_{10,}[ \t]*$/m                   // Outlook separator line
-  ];
-  var cut = text.length;
-  for (var i = 0; i < markers.length; i++) {
-    var m = markers[i].exec(text);
-    if (m && m.index < cut) cut = m.index;
+  var found = markerPositions(text);
+  return found.length ? text.slice(0, found[0]) : text;
+}
+
+// Lines of a quoted block that aren't header lines, blank, or nested (">>") quotes.
+function contentLines(block) {
+  var lines = block.split(/\r?\n/);
+  var out = [];
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i];
+    if (/^[ \t]*$/.test(line) || HEADER_LINE.test(line) || /^[ \t]*>[ \t]*>/.test(line)) continue;
+    out.push(line);
   }
-  return text.slice(0, cut);
+  return out;
+}
+
+// The most recent email in the thread: from the first header down to the next
+// header that follows some real content. A "____" line straight before "From:"
+// counts as one header, not two.
+function latestQuoted(text) {
+  var found = markerPositions(text);
+  if (!found.length) return "";
+  var start = found[0];
+  for (var k = 1; k < found.length; k++) {
+    var block = text.slice(start, found[k]);
+    if (contentLines(block).length) return contentLines(block).join("\n").slice(0, MAX_QUOTED_CHARS);
+  }
+  return contentLines(text.slice(start, start + MAX_QUOTED_CHARS)).join("\n");
 }
 
 function mentionsKeywords(subject, body) {
-  var text = (subject || "") + "\n" + stripQuoted(body || "");
+  body = body || "";
+  var text = (subject || "") + "\n" + stripQuoted(body) + "\n" + latestQuoted(body);
   text = text.replace(/proposals@hotcam\.tv/gi, ""); // the address itself doesn't count
   return KEYWORDS.test(text);
+}
+
+function attachmentsLookLikeQuote(attachments) {
+  for (var i = 0; i < (attachments || []).length; i++) {
+    var a = attachments[i] || {};
+    if (a.isInline) continue;
+    if (ATTACHMENT_NAMES.test(a.name || "")) return true;
+  }
+  return false;
 }
 
 function hasTarget(recipientLists) {
@@ -53,6 +109,27 @@ function onMessageSendHandler(event) {
   var allow = function () { event.completed({ allowEvent: true }); };
   var ok = function (r) { return r.status === Office.AsyncResultStatus.Succeeded; };
 
+  var prompt = function () {
+    // Already prompted on this email and the user removed the CC: respect that.
+    item.sessionData.getAsync(SESSION_FLAG, function (flagRes) {
+      if (ok(flagRes) && flagRes.value) return allow();
+
+      item.cc.addAsync([TARGET], function (addRes) {
+        if (!ok(addRes)) return allow();
+        item.sessionData.setAsync(SESSION_FLAG, "1", function () {
+          event.completed({
+            allowEvent: false,
+            errorMessage:
+              "This looks like a quote, estimate or proposal email, so " + TARGET +
+              " has been added to CC.\n\n" +
+              "Send Anyway: send it with proposals@ copied in.\n" +
+              "Don't Send: go back to check it. If proposals@ isn't needed, remove it and send again."
+          });
+        });
+      });
+    });
+  };
+
   try {
     item.to.getAsync(function (toRes) {
       item.cc.getAsync(function (ccRes) {
@@ -63,25 +140,12 @@ function onMessageSendHandler(event) {
           item.subject.getAsync(function (subRes) {
             item.body.getAsync(Office.CoercionType.Text, function (bodyRes) {
               if (!ok(subRes) || !ok(bodyRes)) return allow();
-              if (!mentionsKeywords(subRes.value, bodyRes.value)) return allow();
+              if (mentionsKeywords(subRes.value, bodyRes.value)) return prompt();
 
-              // Already prompted on this email and the user removed the CC: respect that.
-              item.sessionData.getAsync(SESSION_FLAG, function (flagRes) {
-                if (ok(flagRes) && flagRes.value) return allow();
-
-                item.cc.addAsync([TARGET], function (addRes) {
-                  if (!ok(addRes)) return allow();
-                  item.sessionData.setAsync(SESSION_FLAG, "1", function () {
-                    event.completed({
-                      allowEvent: false,
-                      errorMessage:
-                        "This looks like a quote, budget or proposal email, so " + TARGET +
-                        " has been added to CC.\n\n" +
-                        "Send Anyway: send it with proposals@ copied in.\n" +
-                        "Don't Send: go back to check it. If proposals@ isn't needed, remove it and send again."
-                    });
-                  });
-                });
+              if (typeof item.getAttachmentsAsync !== "function") return allow();
+              item.getAttachmentsAsync(function (attRes) {
+                if (ok(attRes) && attachmentsLookLikeQuote(attRes.value)) return prompt();
+                allow();
               });
             });
           });
@@ -97,5 +161,12 @@ if (typeof Office !== "undefined" && Office.actions) {
   Office.actions.associate("onMessageSendHandler", onMessageSendHandler);
 }
 if (typeof module !== "undefined") {
-  module.exports = { stripQuoted: stripQuoted, mentionsKeywords: mentionsKeywords, hasTarget: hasTarget, onMessageSendHandler: onMessageSendHandler };
+  module.exports = {
+    stripQuoted: stripQuoted,
+    latestQuoted: latestQuoted,
+    mentionsKeywords: mentionsKeywords,
+    attachmentsLookLikeQuote: attachmentsLookLikeQuote,
+    hasTarget: hasTarget,
+    onMessageSendHandler: onMessageSendHandler
+  };
 }
